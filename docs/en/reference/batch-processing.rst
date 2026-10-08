@@ -84,7 +84,7 @@ Iterating results
 
 An alternative solution for bulk updates is to use the
 ``Query#toIterable()`` facility to iterate over the query results step
-by step instead of loading the whole result into memory at once.
+by step instead of hydrating all entities at once.
 The following example shows how to do this, combining the iteration
 with the batching strategy that was already used for bulk inserts:
 
@@ -113,9 +113,66 @@ with the batching strategy that was already used for bulk inserts:
 
 .. note::
 
-    Results may be fully buffered by the database client/ connection allocating
-    additional memory not visible to the PHP process. For large sets this
-    may easily kill the process for no apparent reason.
+    ``toIterable()`` limits how many entities are hydrated at once, but does
+    not disable result buffering in the database driver. With their default
+    settings, ``pdo_mysql`` and ``pdo_pgsql`` buffer the result set. The libpq
+    buffer used by ``pdo_pgsql`` is not included in ``memory_get_usage()`` or
+    constrained by PHP's ``memory_limit``. Large results can therefore exhaust
+    memory even when the UnitOfWork is cleared regularly.
+
+Processing bounded batches
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To bound both driver buffering and the number of managed entities, retrieve
+one limited batch at a time. For example, for an entity with a single integer
+primary key that is not changed during processing:
+
+.. code-block:: php
+
+    <?php
+    $batchSize = 1000;
+    $lastId = null;
+    do {
+        $qb = $em->createQueryBuilder()
+            ->select('u')
+            ->from(MyProject\Model\User::class, 'u')
+            ->orderBy('u.id', 'ASC')
+            ->setMaxResults($batchSize);
+        if ($lastId !== null) {
+            $qb->where('u.id > :lastId')->setParameter('lastId', $lastId);
+        }
+        $users = $qb->getQuery()->getResult();
+        foreach ($users as $user) {
+            $user->increaseCredit();
+            $user->calculateNewBonuses();
+            $lastId = $user->getId();
+        }
+        $em->flush();
+        $em->clear(); // Detaches all objects from Doctrine!
+    } while (count($users) === $batchSize);
+
+The first batch has no lower bound, so zero and negative identifiers are
+included. The ordering key must be unique and immutable. Concurrent inserts,
+deletes or changes to filtering columns mean that this traversal does not
+represent a fixed snapshot. Choose transaction isolation and selection criteria
+according to the application's consistency requirements. Queries that fetch-join
+collections need a different pagination strategy; see :doc:`../tutorials/pagination`.
+
+Unbuffered results
+~~~~~~~~~~~~~~~~~~
+
+For a single pass over a result, driver-specific streaming can avoid the full
+result buffer. For ``pdo_mysql``, set ``PDO::MYSQL_ATTR_USE_BUFFERED_QUERY`` to
+``false`` (``Pdo\Mysql::ATTR_USE_BUFFERED_QUERY`` on PHP 8.4 and later). For
+``pdo_pgsql``, lazy fetching is available with ``PDO::ATTR_PREFETCH`` set to
+``0`` on PHP 8.5 and later.
+
+Consume the active result before executing another query on the same connection,
+including queries triggered by ``flush()`` or loading an association. Depending
+on the driver, another query may fail or silently discard unread rows from the
+first result, ending the iteration early. Use bounded batches or a separate
+connection if additional queries are necessary. Closing a cursor also discards
+its unread rows; it does not preserve them for later processing.
 
 
 Bulk Deletes
@@ -144,7 +201,7 @@ Iterating results
 
 An alternative solution for bulk deletes is to use the
 ``Query#toIterable()`` facility to iterate over the query results step
-by step instead of loading the whole result into memory at once.
+by step instead of hydrating all entities at once.
 The following example shows how to do this:
 
 .. code-block:: php
@@ -175,18 +232,19 @@ Iterating Large Results for Data-Processing
 
 You can use the ``toIterable()`` method just to iterate over a large
 result and no UPDATE or DELETE intention. ``$query->toIterable()`` returns ``iterable``
-so you can process a large result without memory
-problems using the following approach:
+so you can detach each entity after processing it. Driver buffering still
+applies; use the bounded batches or streaming options described above when
+necessary:
 
 .. code-block:: php
 
     <?php
     $q = $this->_em->createQuery('select u from MyProject\Model\User u');
-    foreach ($q->toIterable() as $row) {
-        // do stuff with the data in the row
+    foreach ($q->toIterable() as $user) {
+        // do stuff with the user
 
         // detach from Doctrine, so that it can be Garbage-Collected immediately
-        $this->_em->detach($row[0]);
+        $this->_em->detach($user);
     }
 
 .. note::
